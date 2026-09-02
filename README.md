@@ -1,679 +1,359 @@
-# ProxyBotnet v1.0 | M-Society Root Access Ethical Hacking
+# ProxyBotnet v1.0 — Análisis técnico
 
-> **Aviso de seguridad y atribución**
+> **Aviso de seguridad**
 >
-> Este documento describe el comportamiento observable del código proporcionado. El programa contiene mecanismos de evasión de análisis, persistencia en Windows, un proxy TCP/HTTP autenticado y envío de telemetría a Telegram. Por ello debe tratarse como **software potencialmente no confiable** y no ejecutarse en equipos o redes que no estén expresamente autorizados.
+> Este documento describe el comportamiento observable del código analizado. El programa presenta características asociadas a software potencialmente no confiable, entre ellas evasión de análisis, persistencia en Windows, funcionamiento como proxy y recopilación de información del sistema.
 >
-> **M-Society no debe interpretarse como responsable, autorizadora ni garante de ningún uso del código.** La referencia a una firma, organización, marca o autor en el código o en este documento no constituye evidencia de propiedad, afiliación, autorización o responsabilidad. El uso, modificación, distribución o despliegue de este código corresponde exclusivamente a quien lo realice y debe cumplir las leyes, políticas y autorizaciones aplicables.
+> No debe ejecutarse ni desplegarse en equipos o redes sin autorización expresa.
+>
+> La referencia a nombres, organizaciones, marcas o autores presentes en el código no constituye evidencia de propiedad, afiliación, autorización ni responsabilidad.
 
 ## 1. Resumen
 
-El archivo contiene una aplicación Java para Windows que combina varias funciones:
+El código analizado es una aplicación Java orientada a Windows que combina varios componentes:
 
-1. Ofuscación ligera de cadenas mediante Base64 + XOR.
-2. Detección de depuradores y herramientas de análisis.
-3. Detección de posibles máquinas virtuales/sandboxes.
-4. Esperas y comprobaciones destinadas a dificultar el análisis automatizado.
-5. Cálculo de una huella derivada de identificadores locales.
-6. Elección de un puerto TCP local.
-7. Copia del ejecutable a una ruta de inicio automático.
-8. Persistencia adicional mediante `Run`, una tarea programada y WMI, cuando la comprobación de privilegios lo permite.
-9. Inicio de un servidor/proxy TCP con un máximo de 50 trabajadores concurrentes.
-10. Autenticación del proxy mediante una cabecera personalizada y un token calculado localmente.
-11. Soporte para `CONNECT` y para solicitudes HTTP con reenvío hacia un servidor upstream.
-12. Consulta de IP pública e IP local.
-13. Recolección de nombre de equipo, usuario, puerto, token, uptime y estado de privilegios.
-14. Envío de esa información a la API de Telegram si se configuran `TOKEN` y `CHAT_ID`.
-15. Registro local de eventos en un archivo dentro de `%LOCALAPPDATA%`.
+1. Ofuscación ligera de cadenas mediante Base64 y XOR.
+2. Detección de depuración y herramientas de análisis.
+3. Detección de posibles máquinas virtuales o sandboxes.
+4. Comprobaciones temporales destinadas a dificultar el análisis automatizado.
+5. Fingerprinting basado en identificadores locales del equipo.
+6. Selección dinámica de un puerto TCP local.
+7. Mecanismos de persistencia en Windows.
+8. Servidor/proxy TCP con concurrencia limitada.
+9. Autenticación mediante un token derivado localmente.
+10. Soporte para túneles TCP y reenvío HTTP.
+11. Obtención de información de red y del sistema.
+12. Telemetría externa mediante Telegram cuando las credenciales correspondientes están configuradas.
+13. Registro local de eventos.
+
+No se observa en el código proporcionado una implementación explícita de robo de cookies, lectura de bases de datos de navegadores, captura de teclado, captura de pantalla o ransomware.
 
 ## 2. Flujo general
 
 ```mermaid
 flowchart TD
-    A[Inicio de Main] --> B[Ruido / código muerto]
-    B --> C[Construcción de ruta de log]
-    C --> D{¿Debugger detectado?}
-    D -- Sí --> D1[Registrar ENV_FAIL]
-    D1 --> D2[Esperar 60 s y salir]
-    D -- No --> E{¿VM / sandbox / herramienta de análisis?}
-    E -- Sí --> E1[Registrar ANALYSIS]
-    E1 --> E2[Esperar 30 s y salir]
-    E -- No --> F[Espera aleatoria 10–30 s]
-    F --> G[SHA-256 del ejecutable]
-    G --> H{¿Verificación pasa?}
-    H -- No --> H1[Registrar INTEGRITY y salir]
-    H -- Sí --> I[Recopilar identidad local]
-    I --> J[Elegir puerto TCP]
-    J --> K[Intentar persistencia]
-    K --> L[Iniciar servidor proxy]
-    L --> M[Crear hilo de servicio]
-    M --> N[Registrar PRE_REPORT]
-    N --> O[Recolectar telemetría]
-    O --> P[Enviar reporte a Telegram]
-    P --> Q[Registrar POST_REPORT]
-    Q --> R[Esperar mientras el servicio siga activo]
+    A["Inicio"] --> B["Inicialización"]
+    B --> C{"¿Depuración detectada?"}
+    C -->|Sí| D["Registrar detección y finalizar"]
+    C -->|No| E{"¿Entorno de análisis detectado?"}
+    E -->|Sí| F["Registrar detección y finalizar"]
+    E -->|No| G["Espera inicial"]
+    G --> H["Comprobación de integridad"]
+    H -->|Fallo| I["Finalizar"]
+    H -->|Correcto| J["Recopilar identidad local"]
+    J --> K["Seleccionar puerto"]
+    K --> L["Intentar mecanismos de persistencia"]
+    L --> M["Iniciar proxy"]
+    M --> N["Recopilar telemetría"]
+    N --> O["Enviar reporte externo"]
+    O --> P["Mantener servicio"]
 ```
 
-## 3. Componentes principales
+## 3. Ofuscación
 
-### 3.1. Variables globales
-
-El programa define:
-
-* `Semaphore S = new Semaphore(50)`: se declara un semáforo con capacidad 50, aunque en el código mostrado no se utiliza posteriormente.
-* `Object L`: monitor para serializar escrituras del log.
-* `F`: ruta del archivo de log.
-* `P`: puerto TCP elegido dinámicamente.
-* `T`: token calculado para autenticar clientes del proxy.
-* `Cts`: objeto de cancelación del servicio.
-* `XOR_KEY`: clave fija utilizada para descifrar cadenas.
-* `TOKEN` y `CHAT_ID`: credenciales de Telegram, vacías en la versión proporcionada.
-
-Referencia: líneas 16–28.
-
-### 3.2. Ofuscación de cadenas
-
-La función `dec()`:
-
-1. Decodifica una cadena Base64.
-2. Aplica XOR byte a byte con la clave `S3cr3tK3y!`.
-3. Convierte el resultado a UTF-8.
-4. Si falla, devuelve la cadena original.
+La función `dec()` realiza una transformación sencilla:
 
 ```mermaid
 flowchart LR
-    A[Cadena Base64] --> B[Base64 decode]
-    B --> C[XOR con S3cr3tK3y!]
-    C --> D[UTF-8]
-    D --> E[Cadena usada por el programa]
+    A["Cadena codificada"] --> B["Base64 decode"]
+    B --> C["XOR"]
+    C --> D["UTF-8"]
+    D --> E["Cadena resultante"]
 ```
 
-Esto es **ofuscación**, no cifrado robusto. Su objetivo observable es evitar que muchas cadenas importantes aparezcan directamente en el código compilado/fuente.
-
-Referencia: líneas 30–37.
+Esta técnica debe considerarse ofuscación y no cifrado robusto.
 
 ## 4. Detección de depuración y análisis
 
-La función `a()` implementa varias comprobaciones.
+El código utiliza varias comprobaciones para determinar si se está ejecutando bajo condiciones de análisis.
 
-### 4.1. API `IsDebuggerPresent`
+Entre ellas se encuentran:
 
-Usa JNA para llamar a `kernel32!IsDebuggerPresent()`.
-
-Si devuelve verdadero, el programa considera que está siendo depurado.
-
-### 4.2. Consulta del PEB
-
-También usa `NtQueryInformationProcess()` desde `ntdll` y accede al PEB para comprobar indicadores relacionados con depuración.
-
-### 4.3. Comprobación temporal
-
-Ejecuta un bucle de 2.000.000 de iteraciones y mide su duración mediante `GetTickCount()`.
-
-Si la ejecución tarda más de 800 ms, devuelve una detección positiva.
-
-Esto funciona como una comprobación temporal simple que puede verse afectada por depuración, instrumentación o un entorno especialmente lento.
-
-### 4.4. Búsqueda de procesos conocidos
-
-Ejecuta `tasklist` y busca nombres asociados con herramientas de depuración/análisis, entre ellos:
-
-* x64dbg
-* x32dbg
-* OllyDbg
-* IDA
-* IDA64
-* Cheat Engine
-* dnSpy
-* ILSpy
-* de4dot
-* Process Hacker
-
-Los valores están ofuscados mediante `dec()`.
+* `IsDebuggerPresent`.
+* Consulta de información del proceso/PEB.
+* Comprobaciones temporales.
+* Enumeración de procesos.
+* Búsqueda de herramientas asociadas al análisis o depuración.
 
 ```mermaid
 flowchart TD
-    A[a()] --> B[IsDebuggerPresent]
-    B -->|detectado| X[true]
-    B -->|no detectado| C[Consultar PEB]
-    C -->|detectado| X
-    C -->|no detectado| D[Medir bucle temporal]
-    D -->|> 800 ms| X
-    D -->|normal| E[Ejecutar tasklist]
-    E --> F[Comparar nombres]
-    F -->|coincidencia| X
-    F -->|sin coincidencia| G[false]
+    A["AntiDebug"] --> B["Comprobar debugger"]
+    B -->|Detectado| X["Detección"]
+    B -->|No detectado| C["Comprobar información del proceso"]
+    C -->|Detectado| X
+    C -->|No detectado| D["Comprobación temporal"]
+    D -->|Anómala| X
+    D -->|Normal| E["Enumerar procesos"]
+    E -->|Coincidencia| X
+    E -->|Sin coincidencia| F["Continuar"]
 ```
 
-Referencias: líneas 129–162.
+Este comportamiento constituye una característica de evasión de análisis.
 
-## 5. Detección de máquinas virtuales y sandboxes
+## 5. Detección de VM y sandbox
 
-La función `b()` intenta determinar si el entorno parece automatizado o virtualizado.
+La función correspondiente analiza características del entorno, incluyendo información de hardware, recursos, variables del sistema y procesos.
 
-Consulta mediante WMI:
+Entre las familias de indicadores observadas se encuentran:
 
-* fabricante del equipo;
-* nombre del procesador;
-* número de serie de BIOS;
-* modelo;
-* GPU/controlador de vídeo.
+* VMware.
+* VirtualBox.
+* QEMU.
+* Xen.
+* Parallels.
+* Bochs.
+* Otros indicadores de virtualización.
 
-Compara esos datos con firmas como:
-
-* VMware
-* VirtualBox
-* Vbox
-* QEMU
-* Xen
-* Oracle
-* Virtual
-* Parallels
-* Bochs
-* Innotek
-* Red Hat
-* Amazon EC2
-
-También inspecciona:
-
-* nombre de equipo;
-* nombre de usuario;
-* número de procesadores;
-* RAM física;
-* tamaño del disco;
-* tiempo desde el arranque del sistema;
-* cantidad de elementos recientes;
-* número total de procesos;
-* procesos de herramientas como Wireshark, Fiddler, Charles, Process Monitor, RegMon y FileMon.
-
-Hay umbrales que producen una detección positiva, por ejemplo:
-
-* menos de 2 procesadores;
-* menos de 2 GiB de RAM;
-* disco menor de 60 GiB;
-* tiempo del sistema inferior a 2 minutos;
-* pocos elementos recientes;
-* menos de 15 procesos.
+También se consideran factores como número de procesadores, memoria, almacenamiento, tiempo desde el arranque y cantidad de procesos.
 
 ```mermaid
 flowchart TD
-    A[Entorno] --> B[WMI: hardware]
-    A --> C[Variables de entorno]
-    A --> D[Recursos]
-    A --> E[Procesos]
-    B --> F{Firma VM}
-    C --> G{Nombre sospechoso}
-    D --> H{Umbral bajo}
-    E --> I{Herramienta de análisis}
-    F -->|Sí| X[Detectado]
+    A["Entorno"] --> B["Hardware"]
+    A --> C["Variables del sistema"]
+    A --> D["Recursos"]
+    A --> E["Procesos"]
+
+    B --> F{"¿Indicador de VM?"}
+    C --> G{"¿Indicador sospechoso?"}
+    D --> H{"¿Recursos anómalos?"}
+    E --> I{"¿Herramienta de análisis?"}
+
+    F -->|Sí| X["Detectado"]
     G -->|Sí| X
     H -->|Sí| X
     I -->|Sí| X
-    F -->|No| J[Continuar]
+
+    F -->|No| J["Continuar"]
     G -->|No| J
     H -->|No| J
     I -->|No| J
-    J --> K[false]
 ```
-
-Referencias: líneas 164–230.
 
 ## 6. Comportamiento ante detección
 
-En `main()`:
+Cuando determinadas comprobaciones producen una detección, el programa registra el evento, introduce una espera y finaliza.
 
-* si `a()` detecta depuración, escribe `ENV_FAIL`, espera 60 segundos y termina;
-* si `b()` detecta análisis/virtualización, escribe `ANALYSIS`, espera 30 segundos y termina.
-
-Este comportamiento constituye una forma de **evasión de análisis**.
-
-Referencias: líneas 81–90.
+Este comportamiento reduce la utilidad de determinados entornos automatizados de análisis.
 
 ## 7. Registro local
 
-La función `l()` escribe entradas con timestamp en el archivo `F`.
+El programa mantiene un archivo de registro bajo el perfil local del usuario.
 
-La ruta se construye usando la variable de entorno `%LOCALAPPDATA%` y el nombre ofuscado `svchost.dat`.
-
-El acceso al archivo está protegido por `synchronized (L)`.
-
-El código ignora errores de escritura.
+Las escrituras están sincronizadas para evitar accesos concurrentes al archivo.
 
 ```mermaid
 flowchart LR
-    A[Evento] --> B[l(msg)]
-    B --> C[Timestamp UTC]
-    C --> D[Append]
-    D --> E[%LOCALAPPDATA%\\svchost.dat]
+    A["Evento"] --> B["Función de logging"]
+    B --> C["Timestamp"]
+    C --> D["Escritura"]
+    D --> E["Archivo local"]
 ```
 
-Referencias: líneas 79 y 119–126.
+Los errores de escritura no parecen propagarse de forma significativa al flujo principal.
 
-## 8. Comprobación de integridad
+## 8. Integridad
 
-La función `c()`:
+La comprobación de integridad calcula un SHA-256 del ejecutable.
 
-1. obtiene la ruta del ejecutable actual;
-2. lee el archivo completo;
-3. calcula SHA-256;
-4. comprueba que el resultado tenga 32 bytes;
-5. además exige que el primer byte sea distinto de cero.
+Sin embargo, el código no compara el resultado con un hash de referencia ni con una firma conocida. Por tanto, esta operación no permite determinar por sí sola si el archivo es auténtico.
 
-No existe una comparación contra un hash esperado o una firma conocida.
+## 9. Fingerprinting y autenticación
 
-Por tanto, esta comprobación **no demuestra que el archivo sea auténtico**. Solo verifica una condición débil sobre el resultado del hash.
+El programa recopila varios identificadores locales, entre ellos información del volumen, adaptadores de red e identidad del usuario.
 
-Referencias: líneas 555–563.
-
-## 9. Identidad local y token del proxy
-
-La función `i()` recopila:
-
-* número de serie del volumen C:;
-* primera dirección MAC activa/no-loopback;
-* información del usuario obtenida mediante `whoami`.
-
-Después concatena esos valores:
-
-```text
-volumeSerial|macAddress|userSid
-```
-
-y utiliza HMAC-SHA256 para generar un valor derivado de:
-
-```text
-checker_api_ + COMPUTERNAME + año actual
-```
-
-El resultado Base64 se recorta a 32 caracteres y se almacena en `T`.
-
-Ese valor se utiliza después como secreto de autenticación del proxy.
+A partir de estos datos genera un valor derivado mediante HMAC-SHA256 que posteriormente se utiliza para identificar/autenticar conexiones al proxy.
 
 ```mermaid
 flowchart LR
-    A[Volumen C:] --> D[Salt]
-    B[MAC] --> D
-    C[Identidad de usuario] --> D
-    D --> E[HMAC-SHA256]
-    F[Nombre de equipo + año] --> E
-    E --> G[Base64]
-    G --> H[Primeros 32 caracteres]
-    H --> I[T]
+    A["Identificador de volumen"] --> D["Datos locales"]
+    B["Dirección MAC"] --> D
+    C["Identidad del usuario"] --> D
+    D --> E["HMAC-SHA256"]
+    F["Nombre del equipo y contexto temporal"] --> E
+    E --> G["Valor derivado"]
+    G --> H["Token del proxy"]
 ```
 
-Referencias: líneas 267–305.
+Este mecanismo constituye fingerprinting del sistema y vincula la autenticación con características locales del equipo.
 
-## 10. Elección del puerto
+## 10. Proxy
 
-La función `n()` abre temporalmente un `ServerSocket` con puerto `0`, dejando que el sistema operativo seleccione un puerto libre.
+El componente de red abre un puerto TCP local y acepta conexiones entrantes.
 
-El número elegido se guarda en `P`.
-
-Si la operación falla, se selecciona aleatoriamente un puerto del rango 49152–65535.
-
-Referencia: líneas 309–312.
-
-## 11. Persistencia en Windows
-
-La función `j()` intenta establecer varias formas de inicio automático.
-
-### 11.1. Copia del ejecutable
-
-Construye una ruta bajo:
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs,Startup\svchost.exe
-```
-
-y copia allí el ejecutable actual si no existe o su tamaño difiere.
-
-Después utiliza `attrib` para modificar atributos del archivo.
-
-### 11.2. Clave `Run`
-
-Ejecuta `reg add` para crear una entrada en:
-
-```text
-HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-```
-
-con el nombre `SvcHost32`.
-
-### 11.3. Tarea programada
-
-Si `o()` devuelve verdadero, ejecuta `schtasks /create` para crear una tarea llamada `SvcHost32`.
-
-La tarea se configura para ejecutarse al iniciar sesión y con nivel elevado.
-
-### 11.4. WMI Event Subscription
-
-También intenta crear una suscripción WMI permanente mediante:
-
-* `__EventFilter`;
-* `CommandLineEventConsumer`;
-* `__FilterToConsumerBinding`.
-
-La lógica crea un filtro que reacciona a determinados eventos de modificación de rendimiento y ejecuta el binario.
+Las conexiones se procesan mediante un pool de trabajadores con capacidad limitada.
 
 ```mermaid
 flowchart TD
-    A[j()] --> B[Copia a Startup]
-    A --> C[HKCU Run]
-    A --> D{¿o() indica privilegios?}
-    D -->|Sí| E[Tarea programada]
-    D -->|Sí| F[WMI Event Subscription]
-    D -->|No| G[Omitir E/F]
-    B --> H[Contar éxito]
-    C --> H
-    E --> H
-    F --> H
-    G --> H
-    H --> I[Registrar PERSIST: n/4]
+    A["Socket de escucha"] --> B["Aceptar conexión"]
+    B --> C["Cliente"]
+    C --> D["Pool de trabajadores"]
+    D --> E["Procesar solicitud"]
+    E --> F["Autenticar"]
+    F -->|Fallida| G["Rechazar"]
+    F -->|Correcta| H["Procesar tráfico"]
+    H --> I["Servidor upstream"]
+    I --> J["Transferencia bidireccional"]
+    J --> K["Cerrar conexión"]
 ```
 
-La presencia de varias técnicas de persistencia es uno de los aspectos de mayor riesgo del programa.
+El código soporta solicitudes `CONNECT` y reenvío de tráfico HTTP.
 
-Referencias: líneas 314–356.
+`Proxy-Authorization` es una cabecera HTTP estándar; lo específico del programa es el valor utilizado para la autenticación.
 
-## 12. Comprobación de privilegios
+## 11. Transferencia de datos
 
-La función `o()` ejecuta:
+El puente de comunicación utiliza dos direcciones independientes:
 
-```text
-net session
+```mermaid
+flowchart LR
+    A["Cliente"] --> B["Proxy"]
+    B --> C["Upstream"]
+    C --> B
+    B --> A
 ```
 
-y considera que el comando tuvo éxito como indicación de privilegios administrativos.
+El contenido del flujo se transporta como bytes sin que el proxy necesite interpretar todo el tráfico.
 
-Referencia: líneas 516–522.
+## 12. Persistencia
 
-## 13. Servidor/proxy
+El código contiene varios mecanismos de inicio automático en Windows.
 
-La función `k()`:
+Entre los indicadores documentados se encuentran:
 
-1. abre un `ServerSocket` en `P`;
-2. registra el puerto;
-3. acepta conexiones;
-4. crea un trabajo para cada cliente;
-5. procesa cada conexión mediante `p()`;
-6. usa un `ExecutorService` con 50 hilos;
-7. permanece activo hasta recibir cancelación.
+* Copia del ejecutable en una ubicación de inicio.
+* Entrada de registro `Run`.
+* Tarea programada.
+* Suscripciones WMI persistentes.
 
 ```mermaid
 flowchart TD
-    A[ServerSocket P] --> B[accept()]
-    B --> C[Cliente]
-    C --> D[pool de hasta 50 hilos]
-    D --> E[p(client)]
-    E --> F[Autenticación]
-    F -->|fallo| G[HTTP 407]
-    F -->|OK| H[Procesar solicitud]
-    H --> I[Conectar upstream]
-    I --> J[Transferencia bidireccional]
-    J --> K[Cerrar conexión]
-    K --> B
+    A["Mecanismo de persistencia"] --> B["Inicio automático"]
+    A --> C["Registro"]
+    A --> D["Tarea programada"]
+    A --> E["WMI"]
 ```
 
-Referencias: líneas 368–390.
+La combinación de varias técnicas aumenta significativamente el riesgo durante una evaluación de seguridad.
 
-## 14. Autenticación del proxy
+## 13. Telemetría externa
 
-La función `p()` espera una cabecera HTTP personalizada equivalente a:
+El componente de telemetría recopila información del host, incluyendo:
 
-```text
-Proxy-Authorization
-```
+* IP pública.
+* IP local.
+* Nombre del equipo.
+* Usuario.
+* Estado de privilegios.
+* Uptime.
+* Puerto del proxy.
+* Token derivado.
 
-y comprueba que su valor contenga `T`.
-
-Si falta o no coincide, devuelve:
-
-```text
-HTTP/1.1 407 Proxy Authentication Required
-```
-
-El programa no implementa aquí un sistema completo de usuarios, sesiones, expiración o rotación de credenciales.
-
-Referencias: líneas 393–410.
-
-## 15. Método `CONNECT`
-
-Cuando el método es `CONNECT`:
-
-1. divide el destino en host y puerto;
-2. usa 443 como puerto predeterminado;
-3. crea un socket TCP hacia el destino;
-4. devuelve `200 Connection Established`;
-5. inicia transferencia bidireccional entre cliente y upstream.
-
-Esto permite establecer un túnel TCP a través del proceso.
-
-Referencias: líneas 417–424.
-
-## 16. Reenvío HTTP
-
-Para otros métodos:
-
-1. convierte el destino en `URI`;
-2. obtiene host, puerto, ruta y query;
-3. abre una conexión al upstream;
-4. reconstruye la primera línea HTTP;
-5. reenvía las cabeceras excepto `Proxy-Authorization`;
-6. inicia el puente de datos.
-
-```mermaid
-sequenceDiagram
-    participant C as Cliente
-    participant P as Proxy
-    participant U as Servidor upstream
-
-    C->>P: HTTP request + Proxy-Authorization
-    P->>P: Validar T
-    P->>U: Request reconstruida
-    U-->>P: Respuesta
-    P-->>C: Datos de respuesta
-```
-
-Referencias: líneas 425–443.
-
-## 17. Transferencia de datos
-
-La función `t()` crea dos hilos:
-
-* cliente → upstream;
-* upstream → cliente.
-
-Cada dirección utiliza `u()` con un buffer de 16 KiB.
-
-Esto implementa un puente bidireccional de bytes sin interpretar el contenido del flujo.
-
-Referencias: líneas 453–469.
-
-## 18. Telemetría y reporte externo
-
-La función `m()` obtiene:
-
-* IP pública;
-* IP local;
-* nombre de equipo;
-* usuario;
-* estado de privilegios;
-* uptime;
-* puerto del proxy;
-* token `T`.
-
-Construye un mensaje identificado como:
-
-```text
-ProxyBotnet
-```
-
-y lo envía mediante `sendTelegram()`.
-
-`sendTelegram()` hace un POST HTTPS a la API de Telegram utilizando `TOKEN` y `CHAT_ID`.
-
-En el archivo proporcionado ambos valores están vacíos, por lo que el envío no está configurado funcionalmente en esta copia.
+El mensaje se identifica como `ProxyBotnet v1.0` y puede enviarse a Telegram cuando las credenciales correspondientes están configuradas.
 
 ```mermaid
 flowchart TD
-    A[m()] --> B[IP pública]
-    A --> C[IP local]
-    A --> D[Hostname]
-    A --> E[Usuario]
-    A --> F[Admin]
-    A --> G[Uptime]
-    A --> H[Puerto]
-    A --> I[Token T]
-    B --> J[Construir mensaje]
-    C --> J
-    D --> J
-    E --> J
-    F --> J
-    G --> J
-    H --> J
-    I --> J
-    J --> K[sendTelegram()]
-    K --> L[HTTPS POST]
-    L --> M[api.telegram.org]
+    A["Información del host"] --> B["Construir reporte"]
+    B --> C["Cliente HTTPS"]
+    C --> D["Servicio externo"]
 ```
 
-Referencias: líneas 472–510.
+En la copia analizada, las credenciales de Telegram están vacías, por lo que esta función no está configurada funcionalmente.
 
-## 19. Obtención de IP pública
+## 14. Información de red
 
-La función `v()` prueba sucesivamente tres servicios externos:
+El código consulta servicios externos para determinar la IP pública y enumera las interfaces locales para obtener información de red.
 
-* `api.ipify.org`
-* `icanhazip.com`
-* `ifconfig.me/ip`
+La dependencia de servicios externos debe considerarse un indicador adicional durante una investigación.
 
-Devuelve la primera respuesta HTTP 200 que pueda leer.
+## 15. Qué no se observa
 
-Si todos fallan, devuelve `0.0.0.0`.
+A partir del código disponible, no se observa:
 
-Referencia: líneas 524–540.
+* Lectura de bases de datos de Chrome, Edge o Firefox.
+* Extracción directa de cookies.
+* Lectura directa de contraseñas guardadas.
+* Captura de pulsaciones.
+* Captura de pantalla.
+* Grabación de audio.
+* Cifrado de archivos de usuario.
+* Implementación visible de ransomware.
+* Descarga explícita de una segunda carga.
+* Canal de comandos remotos recibido desde Telegram.
 
-## 20. Obtención de IP local
+La ausencia de estas funciones en el código revisado no implica que el programa sea seguro.
 
-La función `w()` enumera interfaces de red activas y no loopback y devuelve la primera dirección IPv4 encontrada.
+## 16. Indicadores observables
 
-Si no encuentra ninguna, devuelve `127.0.0.1`.
+| Categoría          | Indicador                                                                |
+| ------------------ | ------------------------------------------------------------------------ |
+| Archivo            | `%LOCALAPPDATA%\svchost.dat`                                             |
+| Startup            | `...\Start Menu\Programs,Startup\svchost.exe`                            |
+| Registro           | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`                     |
+| Valor Run          | `SvcHost32`                                                              |
+| Tarea programada   | `SvcHost32`                                                              |
+| WMI                | `__EventFilter`, `CommandLineEventConsumer`, `__FilterToConsumerBinding` |
+| Procesos/comandos  | `tasklist`, `wmic`, `whoami`, `net session`, `reg`, `schtasks`, `attrib` |
+| Red                | Puerto TCP seleccionado dinámicamente                                    |
+| HTTP               | `Proxy-Authorization`                                                    |
+| Servicios externos | `api.ipify.org`, `icanhazip.com`, `ifconfig.me/ip`                       |
+| Telegram           | `api.telegram.org`                                                       |
 
-Referencia: líneas 542–553.
+## 17. Riesgo por componente
 
-## 21. Máquina de estados simplificada
+| Componente      |     Riesgo | Motivo                                                  |
+| --------------- | ---------: | ------------------------------------------------------- |
+| Ofuscación      |      Medio | Dificulta el análisis estático superficial              |
+| Anti-debug      |       Alto | Detecta entornos de análisis                            |
+| Anti-VM/sandbox |       Alto | Identifica posibles entornos automatizados              |
+| Persistencia    |       Alto | Utiliza múltiples mecanismos de inicio automático       |
+| Proxy           |       Alto | Permite reenviar tráfico de red                         |
+| Telemetría      |       Alto | Puede enviar información del host a un servicio externo |
+| Fingerprinting  | Medio/alto | Combina múltiples identificadores locales               |
+| Integridad      |       Bajo | No utiliza un hash esperado                             |
+| Logging         |      Medio | Conserva actividad localmente                           |
 
-```mermaid
-stateDiagram-v2
-    [*] --> Inicialización
-    Inicialización --> AntiDebug
-    AntiDebug --> SalidaDebug: detección
-    AntiDebug --> AntiVM: sin detección
-    AntiVM --> SalidaVM: detección
-    AntiVM --> Espera: sin detección
-    Espera --> Integridad
-    Integridad --> SalidaIntegridad: fallo
-    Integridad --> Identidad: éxito
-    Identidad --> Persistencia
-    Persistencia --> Proxy
-    Proxy --> Telemetría
-    Telemetría --> Servicio
-    Servicio --> Servicio: aceptar conexiones
-    Servicio --> [*]: cancelación
-```
+## 18. Dependencias
 
-## 22. Qué NO hace el código mostrado
+El código depende, como mínimo, de:
 
-A partir del contenido disponible, no se observa:
-
-* lectura de bases de datos de Chrome/Edge/Firefox;
-* extracción de cookies;
-* lectura directa de contraseñas guardadas;
-* captura de pulsaciones de teclado;
-* captura de pantalla;
-* grabación de audio;
-* implementación de ransomware;
-* cifrado de archivos de usuario;
-* descarga de una segunda carga desde Internet;
-* un mecanismo explícito de comandos remotos recibido desde Telegram.
-
-Esto no elimina el riesgo del programa: la combinación de evasión, persistencia, proxy y telemetría ya constituye una superficie de abuso importante.
-
-## 23. Indicadores observables
-
-Los siguientes elementos pueden servir como indicadores durante una revisión defensiva:
-
-| Categoría        | Indicador                                                                |
-| ---------------- | ------------------------------------------------------------------------ |
-| Archivo          | `%LOCALAPPDATA%\svchost.dat`                                             |
-| Startup          | `...\Start Menu\Programs,Startup\svchost.exe`                            |
-| Registro         | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`                     |
-| Valor Run        | `SvcHost32`                                                              |
-| Tarea programada | `SvcHost32`                                                              |
-| WMI              | `__EventFilter`, `CommandLineEventConsumer`, `__FilterToConsumerBinding` |
-| Proceso          | `tasklist`, `wmic`, `whoami`, `net session`, `reg`, `schtasks`, `attrib` |
-| Red              | Puerto TCP elegido dinámicamente                                         |
-| HTTP             | Cabecera `Proxy-Authorization`                                           |
-| Externo          | `api.ipify.org`, `icanhazip.com`, `ifconfig.me/ip`                       |
-| Telegram         | `api.telegram.org/bot.../sendMessage`                                    |
-
-## 24. Riesgo por componente
-
-| Componente            | Riesgo observado | Motivo                                              |
-| --------------------- | ---------------: | --------------------------------------------------- |
-| Ofuscación Base64/XOR |            Medio | Dificulta análisis estático superficial             |
-| Anti-debug            |             Alto | Detecta y evita entornos de análisis                |
-| Anti-VM/sandbox       |             Alto | Intenta impedir ejecución en entornos de inspección |
-| Persistencia          |             Alto | Varias técnicas de inicio automático                |
-| Proxy                 |             Alto | Permite reenviar tráfico TCP/HTTP                   |
-| Telemetría            |             Alto | Envía información del host a un servicio externo    |
-| Fingerprinting        |       Medio/alto | Combina varios identificadores del equipo           |
-| Integridad            |             Bajo | No existe un hash esperado contra el que comparar   |
-| Logging local         |            Medio | Conserva actividad y errores en disco               |
-
-## 25. Dependencias
-
-El código requiere, al menos:
-
-* Java/JDK compatible con las APIs utilizadas;
-* JNA;
-* JNA Platform;
+* Java/JDK compatible con las APIs utilizadas.
+* JNA.
+* JNA Platform.
 * `org.json`.
 
-También depende de APIs y comandos específicos de Windows, entre ellos `kernel32`, `ntdll`, WMI, `tasklist`, `wmic`, `whoami`, `reg`, `schtasks`, `attrib` y `net`.
+También utiliza APIs y componentes específicos de Windows.
 
-## 26. Conclusión
+## 19. Conclusión
 
-El programa no es simplemente un cliente HTTP ni un comprobador de cookies. Su comportamiento combina:
+El programa analizado no corresponde a un comprobador de cookies.
+
+Su comportamiento combina:
 
 ```text
-          ┌───────────────────────┐
-          │      EJECUCIÓN        │
-          └───────────┬───────────┘
-                      │
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-   Evasión         Persistencia   Fingerprint
-        │             │             │
-        └─────────────┼─────────────┘
-                      ▼
-                Servicio proxy
-                      │
-             ┌────────┴────────┐
-             ▼                 ▼
-        Tráfico TCP/HTTP    Telemetría
-                                │
-                                ▼
-                         Telegram HTTPS
+             EJECUCIÓN
+                 |
+      +----------+----------+
+      |          |          |
+    Evasión  Persistencia Fingerprint
+      |          |          |
+      +----------+----------+
+                 |
+              Proxy
+                 |
+        +--------+--------+
+        |                 |
+     TCP/HTTP         Telemetría
+                          |
+                       Externo
 ```
 
-Desde una perspectiva de seguridad, los rasgos más significativos son la evasión de análisis, las múltiples técnicas de persistencia y la capacidad de actuar como proxy autenticado. El envío a Telegram añade una vía de comunicación externa para la información de identificación del host.
+Los aspectos de mayor relevancia para una revisión defensiva son la evasión de análisis, la persistencia múltiple, el fingerprinting del host, la capacidad de actuar como proxy y la posibilidad de enviar telemetría a un servicio externo.
 
-Este README documenta el comportamiento del código recibido; no constituye una validación de seguridad, legitimidad, autoría ni autorización de uso.
+Este documento describe únicamente el comportamiento observado en el código proporcionado. No constituye una validación de seguridad, legitimidad, autoría o autorización.
 
-## 27. Referencia de líneas del código analizado
+## 20. Referencias del código analizado
 
-Las principales áreas documentadas corresponden a:
+Las referencias de líneas corresponden al código fuente analizado y no a este README:
 
 * Inicialización y flujo principal: 16–116.
 * Ofuscación: 30–37.
@@ -681,10 +361,10 @@ Las principales áreas documentadas corresponden a:
 * Anti-VM/sandbox: 164–230.
 * WMI auxiliar: 233–264.
 * Fingerprinting/token: 267–305.
-* Puerto: 309–312.
+* Selección de puerto: 309–312.
 * Persistencia: 314–356.
 * Proxy: 368–469.
-* Telegram: 472–510.
+* Telemetría: 472–510.
 * Privilegios: 516–522.
 * IP pública/local: 524–553.
 * Integridad: 555–563.
